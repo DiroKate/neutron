@@ -24,7 +24,6 @@ import time
 import eventlet.wsgi
 from neutron_lib import context
 from neutron_lib import exceptions as exception
-from neutron_lib.context import Context
 from oslo_config import cfg
 import oslo_i18n
 from oslo_log import log as logging
@@ -62,7 +61,6 @@ def encode_body(body):
 
 class WorkerService(neutron_worker.NeutronWorker):
     """Wraps a worker to be handled by ProcessLauncher"""
-
     def __init__(self, service, application, disable_ssl=False,
                  worker_process_count=0):
         super(WorkerService, self).__init__(worker_process_count)
@@ -149,7 +147,7 @@ class Server(object):
                         eventlet.sleep(0.1)
         if not sock:
             raise RuntimeError(_("Could not bind to %(host)s:%(port)s "
-                                 "after trying for %(time)d seconds") %
+                               "after trying for %(time)d seconds") %
                                {'host': host,
                                 'port': port,
                                 'time': CONF.retry_until_window})
@@ -227,6 +225,7 @@ class Server(object):
 
 
 class Request(wsgi.Request):
+
     def best_match_content_type(self):
         """Determine the most acceptable content-type.
 
@@ -242,13 +241,13 @@ class Request(wsgi.Request):
             if _format in ['json']:
                 return 'application/{0}'.format(_format)
 
-        # Then look up content header
+        #Then look up content header
         type_from_header = self.get_content_type()
         if type_from_header:
             return type_from_header
         ctypes = ['application/json']
 
-        # Finally search in Accept-* headers
+        #Finally search in Accept-* headers
         bm = self.accept.best_match(ctypes)
         return bm or 'application/json'
 
@@ -276,35 +275,8 @@ class Request(wsgi.Request):
     @property
     def context(self):
         if 'neutron.context' not in self.environ:
-            self.environ['neutron.context'] = get_admin_context()
-        else:
-            try:
-                self.environ['neutron.context'].os_id = self.GET['os_id']
-            except KeyError:
-                pass
-
+            self.environ['neutron.context'] = context.get_admin_context()
         return self.environ['neutron.context']
-
-
-class MyContext(Context):
-    def __init__(self, *args, **kwargs):
-        super(MyContext, self).__init__(*args, **kwargs)
-        self._os_id = None
-
-    @property
-    def os_id(self):
-        return self._os_id
-
-    @os_id.setter
-    def os_id(self, value):
-        self._os_id = value
-
-
-def get_admin_context():
-    return MyContext(user_id=None,
-                     tenant_id=None,
-                     is_admin=True,
-                     overwrite=False)
 
 
 class ActionDispatcher(object):
@@ -336,7 +308,6 @@ class JSONDictSerializer(DictSerializer):
     def default(self, data):
         def sanitizer(obj):
             return six.text_type(obj)
-
         return encode_body(jsonutils.dumps(data, default=sanitizer))
 
 
@@ -401,6 +372,7 @@ class TextDeserializer(ActionDispatcher):
 
 
 class JSONDeserializer(TextDeserializer):
+
     def _from_json(self, datastring):
         try:
             return jsonutils.loads(datastring)
@@ -656,7 +628,7 @@ class Resource(Application):
 
         controller_method = getattr(self.controller, action)
         try:
-            # NOTE(salvatore-orlando): the controller method must have
+            #NOTE(salvatore-orlando): the controller method must have
             # an argument whose name is 'request'
             return controller_method(request=request, **action_args)
         except TypeError:

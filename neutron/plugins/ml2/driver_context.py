@@ -12,7 +12,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
+import copy
 from neutron_lib import constants
 from oslo_log import log
 from oslo_serialization import jsonutils
@@ -23,6 +23,20 @@ from neutron.extensions import portbindings
 from neutron.plugins.ml2 import driver_api as api
 
 LOG = log.getLogger(__name__)
+
+
+def addition_param(context, plugin_context, params):
+    context_copy = copy.deepcopy(context)
+    try:
+        for param in params:
+            param_value = getattr(plugin_context, param)
+            if param_value:
+                context_copy[param] = param_value
+
+        return context_copy
+
+    except AttributeError:
+        return context_copy
 
 
 class MechanismDriverContext(object):
@@ -40,7 +54,7 @@ class NetworkContext(MechanismDriverContext, api.NetworkContext):
     def __init__(self, plugin, plugin_context, network,
                  original_network=None):
         super(NetworkContext, self).__init__(plugin, plugin_context)
-        self._network = network
+        self._network = addition_param(network, plugin_context, ['os_id', 'az_id'])
         self._original_network = original_network
         self._segments = segments_db.get_network_segments(
             plugin_context, network['id'])
@@ -63,7 +77,8 @@ class SubnetContext(MechanismDriverContext, api.SubnetContext):
     def __init__(self, plugin, plugin_context, subnet, network,
                  original_subnet=None):
         super(SubnetContext, self).__init__(plugin, plugin_context)
-        self._subnet = subnet
+        self._subnet = addition_param(subnet, plugin_context, ['os_id', 'az_id'])
+        # self._subnet = subnet
         self._original_subnet = original_subnet
         self._network_context = NetworkContext(plugin, plugin_context,
                                                network) if network else None
@@ -91,7 +106,8 @@ class PortContext(MechanismDriverContext, api.PortContext):
     def __init__(self, plugin, plugin_context, port, network, binding,
                  binding_levels, original_port=None):
         super(PortContext, self).__init__(plugin, plugin_context)
-        self._port = port
+        self._port = addition_param(port, plugin_context, ['os_id', 'az_id'])
+        # self._port = port
         self._original_port = original_port
         self._network_context = NetworkContext(plugin, plugin_context,
                                                network) if network else None
