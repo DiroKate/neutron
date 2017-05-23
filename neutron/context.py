@@ -49,6 +49,10 @@ class ContextBase(oslo_context.RequestContext):
         :param kwargs: Extra arguments that might be present, but we ignore
             because they possibly came in from older rpc messages.
         """
+
+        self._os_id = kwargs.pop('os_id', '')
+        self._az_id = kwargs.pop('az_id', '')
+
         super(ContextBase, self).__init__(auth_token=auth_token,
                                           user=user_id, tenant=tenant_id,
                                           is_admin=is_admin,
@@ -66,6 +70,22 @@ class ContextBase(oslo_context.RequestContext):
             self.is_advsvc = self.is_admin or policy.check_is_advsvc(self)
         if self.is_admin is None:
             self.is_admin = policy.check_is_admin(self)
+
+    @property
+    def os_id(self):
+        return self._os_id
+
+    @os_id.setter
+    def os_id(self, os_id):
+        self._os_id = os_id
+
+    @property
+    def az_id(self):
+        return self._az_id
+
+    @az_id.setter
+    def az_id(self, az_id):
+        self._az_id = az_id
 
     @property
     def project_id(self):

@@ -52,10 +52,17 @@ class NeutronKeystoneContext(wsgi.Middleware):
         auth_token = req.headers.get('X_AUTH_TOKEN',
                                      req.headers.get('X_STORAGE_TOKEN'))
 
+        # Add OpenStack ID
+        os_id = req.headers.get('OS_ID')
+
+        # Add AbilityZone ID
+        az_id = req.headers.get('AZ_ID')
+
         # Create a context with the authentication data
         ctx = context.Context(user_id, tenant_id, roles=roles,
                               user_name=user_name, tenant_name=tenant_name,
-                              request_id=req_id, auth_token=auth_token)
+                              request_id=req_id, auth_token=auth_token,
+                              os_id=os_id, az_id=az_id)
 
         # Inject the context...
         req.environ['neutron.context'] = ctx
