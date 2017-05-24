@@ -20,6 +20,7 @@ Unit Tests for ml2 rpc
 import collections
 
 import mock
+from neutron_lib.callbacks import resources
 from neutron_lib import constants
 from neutron_lib.plugins import directory
 from oslo_config import cfg
@@ -27,7 +28,6 @@ from oslo_context import context as oslo_context
 from sqlalchemy.orm import exc
 
 from neutron.agent import rpc as agent_rpc
-from neutron.callbacks import resources
 from neutron.common import topics
 from neutron.db import provisioning_blocks
 from neutron.plugins.ml2.drivers import type_tunnel
@@ -166,21 +166,21 @@ class RpcCallbacksTestCase(base.BaseTestCase):
     def _test_get_devices_list(self, callback, side_effect, expected):
         devices = [1, 2, 3, 4, 5]
         kwargs = {'host': 'fake_host', 'agent_id': 'fake_agent_id'}
-        with mock.patch.object(self.callbacks, 'get_device_details',
+        with mock.patch.object(self.callbacks, '_get_device_details',
                                side_effect=side_effect) as f:
             res = callback('fake_context', devices=devices, **kwargs)
             self.assertEqual(expected, res)
             self.assertEqual(len(devices), f.call_count)
             calls = [mock.call('fake_context', device=i,
-                               cached_networks={}, **kwargs)
+                               port_context=mock.ANY, **kwargs)
                      for i in devices]
             f.assert_has_calls(calls)
 
     def test_get_devices_details_list(self):
-        devices = [1, 2, 3, 4, 5]
-        expected = devices
+        results = [{'device': [v]} for v in [1, 2, 3, 4, 5]]
+        expected = results
         callback = self.callbacks.get_devices_details_list
-        self._test_get_devices_list(callback, devices, expected)
+        self._test_get_devices_list(callback, results, expected)
 
     def test_get_devices_details_list_with_empty_devices(self):
         with mock.patch.object(self.callbacks, 'get_device_details') as f:

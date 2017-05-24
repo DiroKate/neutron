@@ -15,7 +15,6 @@
 import errno
 import itertools
 import os
-import six
 
 import netaddr
 from neutron_lib import exceptions
@@ -27,6 +26,7 @@ from oslo_utils import fileutils
 from neutron._i18n import _, _LE
 from neutron.agent.linux import external_process
 from neutron.common import constants
+from neutron.common import utils
 
 VALID_STATES = ['MASTER', 'BACKUP']
 VALID_AUTH_TYPES = ['AH', 'PASS']
@@ -367,12 +367,20 @@ class KeepalivedManager(object):
     """
 
     def __init__(self, resource_id, config, process_monitor, conf_path='/tmp',
-                 namespace=None):
+                 namespace=None, throttle_restart_value=None):
         self.resource_id = resource_id
         self.config = config
         self.namespace = namespace
         self.process_monitor = process_monitor
         self.conf_path = conf_path
+        # configure throttler for spawn to introduce delay between SIGHUPs,
+        # otherwise keepalived master may unnecessarily flip to slave
+        if throttle_restart_value is not None:
+            self._throttle_spawn(throttle_restart_value)
+
+    #pylint: disable=method-hidden
+    def _throttle_spawn(self, threshold):
+        self.spawn = utils.throttler(threshold)(self.spawn)
 
     def get_conf_dir(self):
         confs_dir = os.path.abspath(os.path.normpath(self.conf_path))
@@ -416,6 +424,10 @@ class KeepalivedManager(object):
     def spawn(self):
         config_path = self._output_config_file()
 
+        for key, instance in self.config.instances.items():
+            if instance.track_script:
+                instance.track_script.write_check_script()
+
         keepalived_pm = self.get_process()
         vrrp_pm = self._get_vrrp_process(
             self.get_vrrp_pid_file_name(keepalived_pm.get_pid_file_name()))
@@ -424,10 +436,6 @@ class KeepalivedManager(object):
             self._get_keepalived_process_callback(vrrp_pm, config_path))
 
         keepalived_pm.enable(reload_cfg=True)
-
-        for key, instance in six.iteritems(self.config.instances):
-            if instance.track_script:
-                instance.track_script.write_check_script()
 
         self.process_monitor.register(uuid=self.resource_id,
                                       service_name=KEEPALIVED_SERVICE_NAME,
@@ -473,6 +481,8 @@ class KeepalivedManager(object):
                    '-f', config_path,
                    '-p', pid_file,
                    '-r', self.get_vrrp_pid_file_name(pid_file)]
+            if logging.is_debug_enabled(cfg.CONF):
+                cmd.append('-D')
             return cmd
 
         return callback

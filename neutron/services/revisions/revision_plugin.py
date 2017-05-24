@@ -11,6 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.services import base as service_base
 from oslo_log import log as logging
 import sqlalchemy
 from sqlalchemy.orm import exc
@@ -20,11 +21,11 @@ from neutron._i18n import _, _LW
 from neutron.db import _resource_extend as resource_extend
 from neutron.db import api as db_api
 from neutron.db import standard_attr
-from neutron.services import service_base
 
 LOG = logging.getLogger(__name__)
 
 
+@resource_extend.has_resource_extenders
 class RevisionPlugin(service_base.ServicePluginBase):
     """Plugin to populate revision numbers into standard attr resources."""
 
@@ -32,9 +33,6 @@ class RevisionPlugin(service_base.ServicePluginBase):
 
     def __init__(self):
         super(RevisionPlugin, self).__init__()
-        for resource in standard_attr.get_standard_attr_resource_model_map():
-            resource_extend.register_funcs(
-                resource, [self.extend_resource_dict_revision])
         db_api.sqla_listen(se.Session, 'before_flush', self.bump_revisions)
 
     def bump_revisions(self, session, context, instances):
@@ -76,7 +74,10 @@ class RevisionPlugin(service_base.ServicePluginBase):
     def get_plugin_description(self):
         return "Adds revision numbers to resources."
 
-    def extend_resource_dict_revision(self, plugin, resource_res, resource_db):
+    @staticmethod
+    @resource_extend.extends(
+        list(standard_attr.get_standard_attr_resource_model_map()))
+    def extend_resource_dict_revision(resource_res, resource_db):
         resource_res['revision_number'] = resource_db.revision_number
 
     def _find_related_obj(self, session, obj, relationship_col):

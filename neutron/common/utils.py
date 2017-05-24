@@ -25,6 +25,7 @@ import os.path
 import random
 import signal
 import sys
+import threading
 import time
 import uuid
 import weakref
@@ -54,11 +55,58 @@ TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 LOG = logging.getLogger(__name__)
 SYNCHRONIZED_PREFIX = 'neutron-'
 
+DEFAULT_THROTTLER_VALUE = 2
+
 synchronized = lockutils.synchronized_with_prefix(SYNCHRONIZED_PREFIX)
 
 
 class WaitTimeout(Exception):
     """Default exception coming from wait_until_true() function."""
+
+
+class LockWithTimer(object):
+    def __init__(self, threshold):
+        self._threshold = threshold
+        self.timestamp = 0
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        return self._lock.acquire(False)
+
+    def release(self):
+        return self._lock.release()
+
+    def time_to_wait(self):
+        return self.timestamp - time.time() + self._threshold
+
+
+# REVISIT(jlibosva): Some parts of throttler may be similar to what
+#                    neutron.notifiers.batch_notifier.BatchNotifier does. They
+#                    could be refactored and unified.
+def throttler(threshold=DEFAULT_THROTTLER_VALUE):
+    """Throttle number of calls to a function to only once per 'threshold'.
+    """
+    def decorator(f):
+        lock_with_timer = LockWithTimer(threshold)
+
+        @functools.wraps(f)
+        def wrapper(*args, **kwargs):
+            if lock_with_timer.acquire():
+                try:
+                    fname = f.__name__
+                    time_to_wait = lock_with_timer.time_to_wait()
+                    if time_to_wait > 0:
+                        LOG.debug("Call of function %s scheduled, sleeping "
+                                  "%.1f seconds", fname, time_to_wait)
+                        # Decorated function has been called recently, wait.
+                        eventlet.sleep(time_to_wait)
+                    lock_with_timer.timestamp = time.time()
+                finally:
+                    lock_with_timer.release()
+                LOG.debug("Calling throttled function %s", fname)
+                return f(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 @removals.remove(
@@ -255,29 +303,12 @@ class DelayedStringRenderer(object):
         return str(self.function(*self.args, **self.kwargs))
 
 
-class _SilentDriverManager(driver.DriverManager):
-    """The lamest of hacks to allow us to pass a kwarg to DriverManager parent.
-
-    DriverManager doesn't accept the warn_on_missing_entrypoint param
-    to pass to its parent on __init__ so we mirror the __init__ here and bypass
-    the one in DriverManager in order to silence the warnings.
-    TODO(kevinbenton): remove once Ia6f5f749fc2f73ca6091fa6d58506fddb058902a
-    is released or we stop supporting loading by class path.
-    """
-    def __init__(self, namespace, name):
-        p = super(driver.DriverManager, self)  # pylint: disable=bad-super-call
-        p.__init__(
-            namespace=namespace, names=[name],
-            on_load_failure_callback=self._default_on_load_failure,
-            warn_on_missing_entrypoint=False
-        )
-
-
 def load_class_by_alias_or_classname(namespace, name):
     """Load class using stevedore alias or the class name
+
     :param namespace: namespace where the alias is defined
     :param name: alias or class name of the class to be loaded
-    :returns class if calls can be loaded
+    :returns: class if calls can be loaded
     :raises ImportError if class cannot be loaded
     """
 
@@ -286,7 +317,8 @@ def load_class_by_alias_or_classname(namespace, name):
         raise ImportError(_("Class not found."))
     try:
         # Try to resolve class by alias
-        mgr = _SilentDriverManager(namespace, name)
+        mgr = driver.DriverManager(
+            namespace, name, warn_on_missing_entrypoint=False)
         class_to_load = mgr.driver
     except RuntimeError:
         e1_info = sys.exc_info()
@@ -652,10 +684,10 @@ def wait_until_true(predicate, timeout=60, sleep=1, exception=None):
                       (default) then WaitTimeout exception is raised.
     """
     try:
-        with eventlet.timeout.Timeout(timeout):
+        with eventlet.Timeout(timeout):
             while not predicate():
                 eventlet.sleep(sleep)
-    except eventlet.TimeoutError:
+    except eventlet.Timeout:
         if exception is not None:
             #pylint: disable=raising-bad-type
             raise exception
@@ -805,3 +837,10 @@ except AttributeError:
 def make_weak_ref(f):
     """Make a weak reference to a function accounting for bound methods."""
     return weak_method(f) if hasattr(f, '__self__') else weakref.ref(f)
+
+
+def resolve_ref(ref):
+    """Handles dereference of weakref."""
+    if isinstance(ref, weakref.ref):
+        ref = ref()
+    return ref

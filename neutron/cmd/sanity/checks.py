@@ -95,7 +95,8 @@ def ofctl_arg_supported(cmd, **kwargs):
     br_name = common_utils.get_rand_device_name(prefix='br-test-')
     with ovs_lib.OVSBridge(br_name) as test_br:
         full_args = ["ovs-ofctl", cmd, test_br.br_name,
-                     ovs_lib._build_flow_expr_str(kwargs, cmd.split('-')[0])]
+                     ovs_lib._build_flow_expr_str(kwargs, cmd.split('-')[0],
+                                                  False)]
         try:
             agent_utils.execute(full_args, run_as_root=True)
         except RuntimeError as e:
@@ -411,6 +412,17 @@ def ip6tables_supported():
         return True
     except (OSError, RuntimeError, IndexError, ValueError) as e:
         LOG.debug("Exception while checking for installed ip6tables. "
+                  "Exception: %s", e)
+        return False
+
+
+def conntrack_supported():
+    try:
+        cmd = ['conntrack', '--version']
+        agent_utils.execute(cmd)
+        return True
+    except (OSError, RuntimeError, IndexError, ValueError) as e:
+        LOG.debug("Exception while checking for installed conntrack. "
                   "Exception: %s", e)
         return False
 

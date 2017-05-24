@@ -14,6 +14,7 @@ from neutron_lib import constants
 
 from oslo_versionedobjects import exception
 
+from neutron.common import constants as n_const
 from neutron.objects.qos import policy
 from neutron.objects.qos import rule
 from neutron.services.qos import qos_consts
@@ -79,6 +80,34 @@ class QosRuleObjectTestCase(neutron_test_base.BaseTestCase):
             device_owner=DEVICE_OWNER_COMPUTE,
             expected_result=True)
 
+    def test_should_apply_to_port_with_router_gw_port_and_net_policy(self):
+        self._test_should_apply_to_port(
+            rule_policy_id=POLICY_ID_B,
+            port_policy_id=POLICY_ID_A,
+            device_owner=constants.DEVICE_OWNER_ROUTER_GW,
+            expected_result=False)
+
+    def test_should_apply_to_port_with_router_gw_port_and_port_policy(self):
+        self._test_should_apply_to_port(
+            rule_policy_id=POLICY_ID_A,
+            port_policy_id=POLICY_ID_A,
+            device_owner=constants.DEVICE_OWNER_ROUTER_GW,
+            expected_result=True)
+
+    def test_should_apply_to_port_with_agent_gw_port_and_net_policy(self):
+        self._test_should_apply_to_port(
+            rule_policy_id=POLICY_ID_B,
+            port_policy_id=POLICY_ID_A,
+            device_owner=constants.DEVICE_OWNER_AGENT_GW,
+            expected_result=False)
+
+    def test_should_apply_to_port_with_agent_gw_port_and_port_policy(self):
+        self._test_should_apply_to_port(
+            rule_policy_id=POLICY_ID_A,
+            port_policy_id=POLICY_ID_A,
+            device_owner=constants.DEVICE_OWNER_AGENT_GW,
+            expected_result=True)
+
 
 class QosBandwidthLimitRuleObjectTestCase(test_base.BaseObjectIfaceTestCase):
 
@@ -88,6 +117,25 @@ class QosBandwidthLimitRuleObjectTestCase(test_base.BaseObjectIfaceTestCase):
         obj = rule.QosBandwidthLimitRule(self.context, **self.db_objs[0])
         dict_ = obj.to_dict()
         self.assertEqual(qos_consts.RULE_TYPE_BANDWIDTH_LIMIT, dict_['type'])
+
+    def test_bandwidth_limit_object_version_degradation(self):
+        self.db_objs[0]['direction'] = n_const.EGRESS_DIRECTION
+        rule_obj = rule.QosBandwidthLimitRule(self.context, **self.db_objs[0])
+        primitive_rule = rule_obj.obj_to_primitive('1.2')
+        self.assertNotIn(
+            "direction", primitive_rule['versioned_object.data'].keys())
+        self.assertEqual(
+            self.db_objs[0]['max_kbps'],
+            primitive_rule['versioned_object.data']['max_kbps'])
+        self.assertEqual(
+            self.db_objs[0]['max_burst_kbps'],
+            primitive_rule['versioned_object.data']['max_burst_kbps'])
+
+        self.db_objs[0]['direction'] = n_const.INGRESS_DIRECTION
+        rule_obj = rule.QosBandwidthLimitRule(self.context, **self.db_objs[0])
+        self.assertRaises(
+            exception.IncompatibleObjectVersion,
+            rule_obj.obj_to_primitive, '1.2')
 
 
 class QosBandwidthLimitRuleDbObjectTestCase(test_base.BaseDbObjectTestCase,
@@ -116,13 +164,6 @@ class QosDscpMarkingRuleObjectTestCase(test_base.BaseObjectIfaceTestCase):
         self.assertRaises(exception.IncompatibleObjectVersion,
                      dscp_rule.obj_to_primitive, '1.0')
 
-    def test_dscp_object_version(self):
-        dscp_rule = rule.QosDscpMarkingRule()
-
-        prim = dscp_rule.obj_to_primitive('1.1')
-
-        self.assertTrue(prim)
-
 
 class QosDscpMarkingRuleDbObjectTestCase(test_base.BaseDbObjectTestCase,
                                          testlib_api.SqlTestCase):
@@ -149,13 +190,6 @@ class QosMinimumBandwidthRuleObjectTestCase(test_base.BaseObjectIfaceTestCase):
         for version in ['1.0', '1.1']:
             self.assertRaises(exception.IncompatibleObjectVersion,
                               min_bw_rule.obj_to_primitive, version)
-
-    def test_min_bw_object_version(self):
-        min_bw_rule = rule.QosMinimumBandwidthRule()
-
-        prim = min_bw_rule.obj_to_primitive('1.2')
-
-        self.assertTrue(prim)
 
 
 class QosMinimumBandwidthRuleDbObjectTestCase(test_base.BaseDbObjectTestCase,

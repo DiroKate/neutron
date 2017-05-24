@@ -78,7 +78,7 @@ class DictModel(dict):
             else:
                 return item
 
-        for key, value in six.iteritems(self):
+        for key, value in self.items():
             if isinstance(value, (list, tuple)):
                 # Keep the same type but convert dicts to DictModels
                 self[key] = type(value)(
@@ -869,6 +869,7 @@ class Dnsmasq(DhcpLocalProcess):
         isolated_subnets = self.get_isolated_subnets(self.network)
         for i, subnet in enumerate(self.network.subnets):
             addr_mode = getattr(subnet, 'ipv6_address_mode', None)
+            segment_id = getattr(subnet, 'segment_id', None)
             if (not subnet.enable_dhcp or
                 (subnet.ip_version == 6 and
                  addr_mode == constants.IPV6_SLAAC)):
@@ -914,10 +915,12 @@ class Dnsmasq(DhcpLocalProcess):
                 )
 
             if subnet.ip_version == 4:
-                host_routes.extend(["%s,0.0.0.0" % (s.cidr) for s in
-                                    self.network.subnets
-                                    if (s.ip_version == 4 and
-                                        s.cidr != subnet.cidr)])
+                for s in self.network.subnets:
+                    sub_segment_id = getattr(s, 'segment_id', None)
+                    if (s.ip_version == 4 and
+                            s.cidr != subnet.cidr and
+                            sub_segment_id == segment_id):
+                        host_routes.append("%s,0.0.0.0" % s.cidr)
 
                 if host_routes:
                     if gateway:
@@ -1337,7 +1340,7 @@ class DeviceManager(object):
         ns_ip = ip_lib.IPWrapper(namespace=network.namespace)
         if not ns_ip.netns.exists(network.namespace):
             return
-        for d in ns_ip.get_devices(exclude_loopback=True):
+        for d in ns_ip.get_devices():
             # delete all devices except current active DHCP port device
             if d.name != skip_dev_name:
                 LOG.debug("Found stale device %s, deleting", d.name)

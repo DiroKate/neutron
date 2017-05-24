@@ -13,6 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import portbindings
+from neutron_lib.callbacks import resources
 from neutron_lib import constants as n_const
 from neutron_lib import exceptions
 from neutron_lib.plugins import directory
@@ -23,12 +25,10 @@ from sqlalchemy.orm import exc
 from neutron._i18n import _LE, _LW
 from neutron.api.rpc.handlers import dvr_rpc
 from neutron.api.rpc.handlers import securitygroups_rpc as sg_rpc
-from neutron.callbacks import resources
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron.db import l3_hamode_db
 from neutron.db import provisioning_blocks
-from neutron.extensions import portbindings
 from neutron.extensions import portsecurity as psec
 from neutron.plugins.ml2 import db as ml2_db
 from neutron.plugins.ml2 import driver_api as api
@@ -58,6 +58,14 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
         self.setup_tunnel_callback_mixin(notifier, type_manager)
         super(RpcCallbacks, self).__init__()
 
+    def _get_new_status(self, host, port_context):
+        port = port_context.current
+        if not host or host == port_context.host:
+            new_status = (n_const.PORT_STATUS_BUILD if port['admin_state_up']
+                          else n_const.PORT_STATUS_DOWN)
+            if port['status'] != new_status:
+                return new_status
+
     def get_device_details(self, rpc_context, **kwargs):
         """Agent requests device details."""
         agent_id = kwargs.get('agent_id')
@@ -82,13 +90,30 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                       {'device': device, 'agent_id': agent_id})
             return {'device': device}
 
-        segment = port_context.bottom_bound_segment
         port = port_context.current
         # caching information about networks for future use
         if cached_networks is not None:
             if port['network_id'] not in cached_networks:
                 cached_networks[port['network_id']] = (
                     port_context.network.current)
+        result = self._get_device_details(rpc_context, agent_id=agent_id,
+                                          host=host, device=device,
+                                          port_context=port_context)
+        if 'network_id' in result:
+            # success so we update status
+            new_status = self._get_new_status(host, port_context)
+            if new_status:
+                plugin.update_port_status(rpc_context,
+                                          port_id,
+                                          new_status,
+                                          host,
+                                          port_context.network.current)
+        return result
+
+    def _get_device_details(self, rpc_context, agent_id, host, device,
+                            port_context):
+        segment = port_context.bottom_bound_segment
+        port = port_context.current
 
         if not segment:
             LOG.warning(_LW("Device %(device)s requested by agent "
@@ -100,16 +125,6 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                          'vif_type': port_context.vif_type})
             return {'device': device}
 
-        if (not host or host == port_context.host):
-            new_status = (n_const.PORT_STATUS_BUILD if port['admin_state_up']
-                          else n_const.PORT_STATUS_DOWN)
-            if port['status'] != new_status:
-                plugin.update_port_status(rpc_context,
-                                          port_id,
-                                          new_status,
-                                          host,
-                                          port_context.network.current)
-
         network_qos_policy_id = port_context.network._network.get(
             qos_consts.QOS_POLICY_ID)
         entry = {'device': device,
@@ -120,6 +135,7 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                  'network_type': segment[api.NETWORK_TYPE],
                  'segmentation_id': segment[api.SEGMENTATION_ID],
                  'physical_network': segment[api.PHYSICAL_NETWORK],
+                 'mtu': port_context.network._network.get('mtu'),
                  'fixed_ips': port['fixed_ips'],
                  'device_owner': port['device_owner'],
                  'allowed_address_pairs': port['allowed_address_pairs'],
@@ -148,18 +164,44 @@ class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
                                                     **kwargs):
         devices = []
         failed_devices = []
-        cached_networks = {}
-        for device in kwargs.pop('devices', []):
+        devices_to_fetch = kwargs.pop('devices', [])
+        plugin = directory.get_plugin()
+        host = kwargs.get('host')
+        bound_contexts = plugin.get_bound_ports_contexts(rpc_context,
+                                                         devices_to_fetch,
+                                                         host)
+        for device in devices_to_fetch:
+            if not bound_contexts.get(device):
+                # unbound bound
+                LOG.debug("Device %(device)s requested by agent "
+                          "%(agent_id)s not found in database",
+                          {'device': device,
+                           'agent_id': kwargs.get('agent_id')})
+                devices.append({'device': device})
+                continue
             try:
-                devices.append(self.get_device_details(
+                devices.append(self._get_device_details(
                                rpc_context,
+                               agent_id=kwargs.get('agent_id'),
+                               host=host,
                                device=device,
-                               cached_networks=cached_networks,
-                               **kwargs))
+                               port_context=bound_contexts[device]))
             except Exception:
-                LOG.error(_LE("Failed to get details for device %s"),
-                          device)
+                LOG.exception(_LE("Failed to get details for device %s"),
+                              device)
                 failed_devices.append(device)
+        new_status_map = {ctxt.current['id']: self._get_new_status(host, ctxt)
+                          for ctxt in bound_contexts.values() if ctxt}
+        # filter out any without status changes
+        new_status_map = {p: s for p, s in new_status_map.items() if s}
+        try:
+            for port_id, new_status in new_status_map.items():
+                plugin.update_port_status(rpc_context, port_id,
+                                          new_status, host)
+        except Exception:
+            LOG.exception("Failure updating statuses, retrying all")
+            failed_devices = devices_to_fetch
+            devices = []
 
         return {'devices': devices,
                 'failed_devices': failed_devices}

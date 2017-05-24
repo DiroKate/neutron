@@ -16,7 +16,6 @@ from neutron_lib import context
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_middleware import base
-from oslo_middleware import request_id
 import webob.dec
 import webob.exc
 
@@ -28,12 +27,13 @@ class NeutronKeystoneContext(base.ConfigurableMiddleware):
 
     @webob.dec.wsgify
     def __call__(self, req):
-        # Determine the user ID
-        user_id = req.headers.get('X_USER_ID')
-        if not user_id:
+        ctx = context.Context.from_environ(req.environ)
+
+        if not ctx.user_id:
             LOG.debug("X_USER_ID is not found in request")
             return webob.exc.HTTPUnauthorized()
 
+<<<<<<< HEAD
         # Determine the tenant
         tenant_id = req.headers.get('X_PROJECT_ID')
 
@@ -63,6 +63,8 @@ class NeutronKeystoneContext(base.ConfigurableMiddleware):
                               request_id=req_id, auth_token=auth_token,
                               os_id=os_id, az_id=az_id)
 
+=======
+>>>>>>> 80e8304bfe677a62a5e7bc503ba4386f99d240a9
         # Inject the context...
         req.environ['neutron.context'] = ctx
 

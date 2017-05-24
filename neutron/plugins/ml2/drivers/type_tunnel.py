@@ -20,7 +20,6 @@ import netaddr
 from neutron_lib import context
 from neutron_lib import exceptions as exc
 from oslo_config import cfg
-from oslo_db import api as oslo_db_api
 from oslo_db import exception as db_exc
 from oslo_log import log
 import six
@@ -62,47 +61,47 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
     def add_endpoint(self, ip, host):
         """Register the endpoint in the type_driver database.
 
-        param ip: the IP address of the endpoint
-        param host: the Host name of the endpoint
+        :param ip: the IP address of the endpoint
+        :param host: the Host name of the endpoint
         """
 
     @abc.abstractmethod
     def get_endpoints(self):
         """Get every endpoint managed by the type_driver
 
-        :returns a list of dict [{ip_address:endpoint_ip, host:endpoint_host},
-        ..]
+        :returns: a list of dict [{ip_address:endpoint_ip, host:endpoint_host},
+         ..]
         """
 
     @abc.abstractmethod
     def get_endpoint_by_host(self, host):
         """Get endpoint for a given host managed by the type_driver
 
-        param host: the Host name of the endpoint
+        :param host: the Host name of the endpoint
 
         if host found in type_driver database
-           :returns db object for that particular host
+           :returns: db object for that particular host
         else
-           :returns None
+           :returns: None
         """
 
     @abc.abstractmethod
     def get_endpoint_by_ip(self, ip):
         """Get endpoint for a given tunnel ip managed by the type_driver
 
-        param ip: the IP address of the endpoint
+        :param ip: the IP address of the endpoint
 
         if ip found in type_driver database
-           :returns db object for that particular ip
+           :returns: db object for that particular ip
         else
-           :returns None
+           :returns: None
         """
 
     @abc.abstractmethod
     def delete_endpoint(self, ip):
         """Delete the endpoint in the type_driver database.
 
-        param ip: the IP address of the endpoint
+        :param ip: the IP address of the endpoint
         """
 
     @abc.abstractmethod
@@ -112,8 +111,8 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
         This function will delete any endpoint matching the specified
         ip or host.
 
-        param host: the host name of the endpoint
-        param ip: the IP address of the endpoint
+        :param host: the host name of the endpoint
+        :param ip: the IP address of the endpoint
         """
 
     def _initialize(self, raw_tunnel_ranges):
@@ -136,9 +135,7 @@ class _TunnelTypeDriverBase(helpers.SegmentTypeDriver):
         LOG.info(_LI("%(type)s ID ranges: %(range)s"),
                  {'type': self.get_type(), 'range': current_range})
 
-    @oslo_db_api.wrap_db_retry(
-        max_retries=db_api.MAX_RETRIES,
-        exception_checker=db_api.is_retriable)
+    @db_api.retry_db_errors
     def sync_allocations(self):
         # determine current configured allocatable tunnel ids
         tunnel_ids = set()
@@ -314,7 +311,7 @@ class ML2TunnelTypeDriver(_TunnelTypeDriverBase):
         inside = any(lo <= tunnel_id <= hi for lo, hi in self.tunnel_ranges)
 
         info = {'type': self.get_type(), 'id': tunnel_id}
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             query = (context.session.query(self.model).
                      filter_by(**{self.segmentation_key: tunnel_id}))
             if inside:
@@ -331,6 +328,7 @@ class ML2TunnelTypeDriver(_TunnelTypeDriverBase):
         if not count:
             LOG.warning(_LW("%(type)s tunnel %(id)s not found"), info)
 
+    @db_api.context_manager.reader
     def get_allocation(self, context, tunnel_id):
         return (context.session.query(self.model).
                 filter_by(**{self.segmentation_key: tunnel_id}).

@@ -13,22 +13,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import provider_net as provider
 from neutron_lib.api import validators
 from neutron_lib import constants
 from neutron_lib import exceptions as exc
 from oslo_config import cfg
 from oslo_log import log
 from oslo_utils import excutils
-import six
 import stevedore
 
-from neutron._i18n import _, _LE, _LI, _LW
+from neutron._i18n import _, _LC, _LE, _LI, _LW
 from neutron.db import api as db_api
 from neutron.db import segments_db
 from neutron.extensions import external_net
 from neutron.extensions import multiprovidernet as mpnet
-from neutron.extensions import portbindings
-from neutron.extensions import providernet as provider
 from neutron.extensions import vlantransparent
 from neutron.plugins.ml2.common import exceptions as ml2_exc
 from neutron.plugins.ml2 import driver_api as api
@@ -178,7 +177,7 @@ class TypeManager(stevedore.named.NamedExtensionManager):
             network[provider.SEGMENTATION_ID] = segment[api.SEGMENTATION_ID]
 
     def initialize(self):
-        for network_type, driver in six.iteritems(self.drivers):
+        for network_type, driver in self.drivers.items():
             LOG.info(_LI("Initializing driver for type '%s'"), network_type)
             driver.obj.initialize()
 
@@ -190,8 +189,7 @@ class TypeManager(stevedore.named.NamedExtensionManager):
     def create_network_segments(self, context, network, tenant_id):
         """Call type drivers to create network segments."""
         segments = self._process_provider_create(network)
-        session = context.session
-        with session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             network_id = network['id']
             if segments:
                 for segment_index, segment in enumerate(segments):
@@ -224,7 +222,7 @@ class TypeManager(stevedore.named.NamedExtensionManager):
         self.validate_provider_segment(segment)
 
         # Reserve segment in type driver
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             return self.reserve_provider_segment(context, segment)
 
     def is_partial_segment(self, segment):
@@ -345,16 +343,33 @@ class MechanismManager(stevedore.named.NamedExtensionManager):
 
         LOG.info(_LI("Configured mechanism driver names: %s"),
                  cfg.CONF.ml2.mechanism_drivers)
-        super(MechanismManager, self).__init__('neutron.ml2.mechanism_drivers',
-                                               cfg.CONF.ml2.mechanism_drivers,
-                                               invoke_on_load=True,
-                                               name_order=True)
+        super(MechanismManager, self).__init__(
+            'neutron.ml2.mechanism_drivers',
+            cfg.CONF.ml2.mechanism_drivers,
+            invoke_on_load=True,
+            name_order=True,
+            on_missing_entrypoints_callback=self._driver_not_found,
+            on_load_failure_callback=self._driver_not_loaded
+        )
         LOG.info(_LI("Loaded mechanism driver names: %s"), self.names())
         self._register_mechanisms()
         self.host_filtering_supported = self.is_host_filtering_supported()
         if not self.host_filtering_supported:
             LOG.info(_LI("No mechanism drivers provide segment reachability "
                          "information for agent scheduling."))
+
+    def _driver_not_found(self, names):
+        msg = (_("The following mechanism drivers were not found: %s")
+               % names)
+        LOG.critical(msg)
+        raise SystemExit(msg)
+
+    def _driver_not_loaded(self, manager, entrypoint, exception):
+        LOG.critical(_LC("The '%(entrypoint)s' entrypoint could not be"
+                         " loaded for the following reason: '%(reason)s'."),
+                     {'entrypoint': entrypoint,
+                      'reason': exception})
+        raise SystemExit(str(exception))
 
     def _register_mechanisms(self):
         """Register all mechanism drivers.
@@ -937,9 +952,9 @@ class ExtensionManager(stevedore.named.NamedExtensionManager):
             try:
                 getattr(driver.obj, method_name)(session, base_model, result)
             except Exception:
-                LOG.error(_LE("Extension driver '%(name)s' failed in "
-                          "%(method)s"),
-                          {'name': driver.name, 'method': method_name})
+                LOG.exception(_LE("Extension driver '%(name)s' failed in "
+                                  "%(method)s"),
+                              {'name': driver.name, 'method': method_name})
                 raise ml2_exc.ExtensionDriverError(driver=driver.name)
 
     def extend_network_dict(self, session, base_model, result):

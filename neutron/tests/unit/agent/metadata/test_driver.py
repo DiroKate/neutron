@@ -21,6 +21,7 @@ from oslo_utils import uuidutils
 
 from neutron.agent.l3 import agent as l3_agent
 from neutron.agent.l3 import router_info
+from neutron.agent.linux import iptables_manager
 from neutron.agent.metadata import driver as metadata_driver
 from neutron.common import constants
 from neutron.conf.agent import common as agent_config
@@ -97,6 +98,24 @@ class TestMetadataDriverProcess(base.BaseTestCase):
             f.assert_called_once_with(
                 'router', 'after_update', agent, router=ri)
 
+    def test_after_router_updated_should_not_call_add_metadata_rules(self):
+        with mock.patch.object(iptables_manager.IptablesTable,
+                               'add_rule') as f,\
+                mock.patch.object(iptables_manager.IptablesManager,
+                                  'apply'),\
+                mock.patch.object(metadata_driver.MetadataDriver,
+                                  'spawn_monitored_metadata_proxy'),\
+                mock.patch.object(router_info.RouterInfo, 'process'):
+            agent = l3_agent.L3NATAgent('localhost')
+            router_id = _uuid()
+            router = {'id': router_id}
+            ri = router_info.RouterInfo(mock.Mock(), router_id, router,
+                                        agent.conf, mock.ANY)
+            agent.router_info[router_id] = ri
+            f.reset_mock()
+            agent._process_updated_router(router)
+            f.assert_not_called()
+
     def test_spawn_metadata_proxy(self):
         router_id = _uuid()
         router_ns = 'qrouter-%s' % router_id
@@ -153,7 +172,7 @@ class TestMetadataDriverProcess(base.BaseTestCase):
             ip_mock.assert_has_calls([
                 mock.call(namespace=router_ns),
                 mock.call().netns.execute(netns_execute_args, addl_env=None,
-                                          run_as_root=False)
+                                          run_as_root=True)
             ])
 
     def test_create_config_file_wrong_user(self):

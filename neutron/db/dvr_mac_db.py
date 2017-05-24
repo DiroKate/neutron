@@ -13,6 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import portbindings
+from neutron_lib.callbacks import events
+from neutron_lib.callbacks import registry
+from neutron_lib.callbacks import resources
 from neutron_lib import constants
 from neutron_lib import exceptions as n_exc
 from neutron_lib.plugins import directory
@@ -25,15 +29,11 @@ from sqlalchemy import or_
 from sqlalchemy.orm import exc
 
 from neutron._i18n import _, _LE
-from neutron.callbacks import events
-from neutron.callbacks import registry
-from neutron.callbacks import resources
 from neutron.common import utils
 from neutron.db import api as db_api
 from neutron.db.models import dvr as dvr_models
 from neutron.db import models_v2
 from neutron.extensions import dvr as ext_dvr
-from neutron.extensions import portbindings
 
 
 LOG = logging.getLogger(__name__)
@@ -161,7 +161,7 @@ class DVRDbMixin(ext_dvr.DVRMacAddressPluginBase):
         :param context: rpc request context
         :param host: host id to match and extract ports of interest
         :param subnet: subnet id to match and extract ports of interest
-        :returns list -- Ports on the given subnet in the input host
+        :returns: list -- Ports on the given subnet in the input host
         """
         filters = {'fixed_ips': {'subnet_id': [subnet]},
                    portbindings.HOST_ID: [host]}

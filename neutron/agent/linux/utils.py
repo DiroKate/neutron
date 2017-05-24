@@ -20,10 +20,10 @@ import pwd
 import shlex
 import socket
 import threading
+import time
 
 import eventlet
 from eventlet.green import subprocess
-from eventlet import greenthread
 from neutron_lib.utils import helpers
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -107,7 +107,11 @@ def execute_rootwrap_daemon(cmd, process_input, addl_env):
     # just logging the execution error.
     LOG.debug("Running command (rootwrap daemon): %s", cmd)
     client = RootwrapDaemonHelper.get_client()
-    return client.execute(cmd, process_input)
+    try:
+        return client.execute(cmd, process_input)
+    except Exception:
+        with excutils.save_and_reraise_exception():
+            LOG.error(_LE("Rootwrap error running command: %s"), cmd)
 
 
 def execute(cmd, process_input=None, addl_env=None,
@@ -152,7 +156,7 @@ def execute(cmd, process_input=None, addl_env=None,
         # NOTE(termie): this appears to be necessary to let the subprocess
         #               call clean something up in between calls, without
         #               it two execute calls in a row hangs the second one
-        greenthread.sleep(0)
+        time.sleep(0)
 
     return (_stdout, _stderr) if return_stderr else _stdout
 
@@ -417,4 +421,5 @@ class UnixDomainWSGIServer(wsgi.Server):
                              application,
                              max_size=self.num_threads,
                              protocol=UnixDomainHttpProtocol,
-                             log=logger)
+                             log=logger,
+                             log_format=cfg.CONF.wsgi_log_format)

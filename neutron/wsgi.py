@@ -221,6 +221,7 @@ class Server(object):
                              max_size=self.num_threads,
                              log=LOG,
                              keepalive=CONF.wsgi_keep_alive,
+                             log_format=CONF.wsgi_log_format,
                              socket_timeout=self.client_socket_timeout)
 
 
@@ -410,7 +411,7 @@ class RequestDeserializer(object):
         """Extract necessary pieces of the request.
 
         :param request: Request object
-        :returns tuple of expected controller action name, dictionary of
+        :returns: tuple of expected controller action name, dictionary of
                  keyword arguments to pass to the controller, the expected
                  content type of the response
 

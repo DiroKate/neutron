@@ -28,7 +28,7 @@ class NetworkPortSecurityDbObjTestCase(obj_test_base.BaseDbObjectTestCase,
 
     def setUp(self):
         super(NetworkPortSecurityDbObjTestCase, self).setUp()
-        self.update_obj_fields({'id': lambda: self._create_network().id})
+        self.update_obj_fields({'id': lambda: self._create_test_network_id()})
 
 
 class NetworkSegmentIfaceObjTestCase(obj_test_base.BaseObjectIfaceTestCase):
@@ -51,8 +51,29 @@ class NetworkSegmentDbObjTestCase(obj_test_base.BaseDbObjectTestCase,
 
     def setUp(self):
         super(NetworkSegmentDbObjTestCase, self).setUp()
-        network = self._create_network()
-        self.update_obj_fields({'network_id': network.id})
+        self.update_obj_fields(
+            {'network_id': lambda: self._create_test_network_id()})
+
+    def test_hosts(self):
+        hosts = ['host1', 'host2']
+        obj = self._make_object(self.obj_fields[0])
+        obj.hosts = hosts
+        obj.create()
+
+        obj = network.NetworkSegment.get_object(self.context, id=obj.id)
+        self.assertEqual(hosts, obj.hosts)
+
+        obj.hosts = ['host3']
+        obj.update()
+
+        obj = network.NetworkSegment.get_object(self.context, id=obj.id)
+        self.assertEqual(['host3'], obj.hosts)
+
+        obj.hosts = None
+        obj.update()
+
+        obj = network.NetworkSegment.get_object(self.context, id=obj.id)
+        self.assertFalse(obj.hosts)
 
 
 class NetworkObjectIfaceTestCase(obj_test_base.BaseObjectIfaceTestCase):
@@ -161,9 +182,8 @@ class SegmentHostMappingDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
 
     def setUp(self):
         super(SegmentHostMappingDbObjectTestCase, self).setUp()
-        self._create_test_network()
-        self._create_test_segment(network=self._network)
-        self.update_obj_fields({'segment_id': self._segment['id']})
+        self.update_obj_fields(
+            {'segment_id': lambda: self._create_test_segment_id()})
 
 
 class NetworkDNSDomainIfaceObjectTestcase(
@@ -180,7 +200,7 @@ class NetworkDNSDomainDbObjectTestcase(obj_test_base.BaseDbObjectTestCase,
     def setUp(self):
         super(NetworkDNSDomainDbObjectTestcase, self).setUp()
         self.update_obj_fields(
-            {'network_id': lambda: self._create_network().id})
+            {'network_id': lambda: self._create_test_network_id()})
 
 
 class ExternalNetworkIfaceObjectTestCase(
@@ -197,4 +217,4 @@ class ExternalNetworkDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
     def setUp(self):
         super(ExternalNetworkDbObjectTestCase, self).setUp()
         self.update_obj_fields(
-            {'network_id': lambda: self._create_network().id})
+            {'network_id': lambda: self._create_test_network_id()})

@@ -111,6 +111,10 @@ class InvalidAllocationPool(e.BadRequest):
     message = _("The allocation pool %(pool)s is not valid.")
 
 
+class QosRuleNotSupported(e.Conflict):
+    message = _("Rule %(rule_type)s is not supported by port %(port_id)s")
+
+
 class UnsupportedPortDeviceOwner(e.Conflict):
     message = _("Operation %(op)s is not supported for device_owner "
                 "%(device_owner)s on port %(port_id)s.")
@@ -155,6 +159,13 @@ class InvalidQuotaValue(e.Conflict):
 class InvalidSharedSetting(e.Conflict):
     message = _("Unable to reconfigure sharing settings for network "
                 "%(network)s. Multiple tenants are using it.")
+
+
+class QoSRuleParameterConflict(e.Conflict):
+    message = _("Unable to add the rule with value %(rule_value)s to the "
+                "policy %(policy_id)s as the existing rule of type "
+                "%(existing_rule)s restricts the bandwidth to "
+                "%(existing_value)s.")
 
 
 class InvalidExtensionEnv(e.BadRequest):

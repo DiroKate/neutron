@@ -17,6 +17,10 @@ import functools
 
 import netaddr
 from neutron_lib.api import validators
+from neutron_lib.callbacks import events
+from neutron_lib.callbacks import exceptions
+from neutron_lib.callbacks import registry
+from neutron_lib.callbacks import resources
 from neutron_lib import constants
 from neutron_lib import context as ctx
 from neutron_lib import exceptions as exc
@@ -33,15 +37,12 @@ from sqlalchemy import not_
 from neutron._i18n import _, _LE, _LI
 from neutron.api.rpc.agentnotifiers import l3_rpc_agent_api
 from neutron.api.v2 import attributes
-from neutron.callbacks import events
-from neutron.callbacks import exceptions
-from neutron.callbacks import registry
-from neutron.callbacks import resources
 from neutron.common import constants as n_const
 from neutron.common import exceptions as n_exc
 from neutron.common import ipv6_utils
 from neutron.common import utils
 from neutron.db import _model_query as model_query
+from neutron.db import _resource_extend as resource_extend
 from neutron.db import _utils as ndb_utils
 from neutron.db import api as db_api
 from neutron.db import db_base_plugin_common
@@ -109,6 +110,17 @@ def _update_subnetpool_dict(orig_pool, new_pool):
     return updated
 
 
+def _port_filter_hook(context, original_model, conditions):
+    # Apply the port filter only in non-admin and non-advsvc context
+    if ndb_utils.model_query_scope_is_project(context, original_model):
+        conditions |= (models_v2.Port.network_id.in_(
+            context.session.query(models_v2.Network.id).
+            filter(context.project_id == models_v2.Network.project_id).
+            subquery()))
+    return conditions
+
+
+@registry.has_registry_receivers
 class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                         neutron_plugin_base_v2.NeutronPluginBaseV2,
                         rbac_mixin.RbacPluginMixin,
@@ -128,6 +140,15 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
     __native_pagination_support = True
     __native_sorting_support = True
 
+    def __new__(cls, *args, **kwargs):
+        model_query.register_hook(
+            models_v2.Port,
+            "port",
+            query_hook=None,
+            filter_hook=_port_filter_hook,
+            result_filters=None)
+        return super(NeutronDbPluginV2, cls).__new__(cls, *args, **kwargs)
+
     def __init__(self):
         self.set_ipam_backend()
         if cfg.CONF.notify_nova_on_port_status_changes:
@@ -143,11 +164,10 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                                self.nova_notifier.send_port_status)
             db_api.sqla_listen(models_v2.Port.status, 'set',
                                self.nova_notifier.record_port_status_changed)
-        for e in (events.BEFORE_CREATE, events.BEFORE_UPDATE,
-                  events.BEFORE_DELETE):
-            registry.subscribe(self.validate_network_rbac_policy_change,
-                               rbac_mixin.RBAC_POLICY, e)
 
+    @registry.receives(rbac_mixin.RBAC_POLICY, [events.BEFORE_CREATE,
+                                                events.BEFORE_UPDATE,
+                                                events.BEFORE_DELETE])
     @db_api.retry_if_session_inactive()
     def validate_network_rbac_policy_change(self, resource, event, trigger,
                                             context, object_type, policy,
@@ -175,6 +195,9 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                 raise exc.InvalidInput(error_message=msg)
 
         tenant_to_check = None
+        self_sharing = policy['target_tenant'] == net['tenant_id']
+        if self_sharing:
+            return
         if event == events.BEFORE_UPDATE:
             new_tenant = kwargs['policy_update']['target_tenant']
             if policy['target_tenant'] != new_tenant:
@@ -191,10 +214,11 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                                           tenant_id):
         ctx_admin = ctx.get_admin_context()
         rb_model = rbac_db.NetworkRBAC
-        other_rbac_entries = self._model_query(ctx_admin, rb_model).filter(
-            and_(rb_model.object_id == network_id,
-                 rb_model.action == 'access_as_shared'))
-        ports = self._model_query(ctx_admin, models_v2.Port).filter(
+        other_rbac_entries = model_query.query_with_hooks(
+            ctx_admin, rb_model).filter(
+                and_(rb_model.object_id == network_id,
+                     rb_model.action == 'access_as_shared'))
+        ports = model_query.query_with_hooks(ctx_admin, models_v2.Port).filter(
             models_v2.Port.network_id == network_id)
         if tenant_id == '*':
             # for the wildcard we need to get all of the rbac entries to
@@ -241,11 +265,11 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
         # goes from True to False
         if updated['shared'] == original.shared or updated['shared']:
             return
-        ports = self._model_query(
+        ports = model_query.query_with_hooks(
             context, models_v2.Port).filter(models_v2.Port.network_id == id)
         ports = ports.filter(not_(models_v2.Port.device_owner.startswith(
             constants.DEVICE_OWNER_NETWORK_PREFIX)))
-        subnets = self._model_query(
+        subnets = model_query.query_with_hooks(
             context, models_v2.Subnet).filter(
                 models_v2.Subnet.network_id == id)
         tenant_ids = set([port['tenant_id'] for port in ports] +
@@ -322,14 +346,12 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
         objects = []
         collection = "%ss" % resource
         items = request_items[collection]
-        context.session.begin(subtransactions=True)
         try:
-            for item in items:
-                obj_creator = getattr(self, 'create_%s' % resource)
-                objects.append(obj_creator(context, item))
-            context.session.commit()
+            with db_api.context_manager.writer.using(context):
+                for item in items:
+                    obj_creator = getattr(self, 'create_%s' % resource)
+                    objects.append(obj_creator(context, item))
         except Exception:
-            context.session.rollback()
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE("An exception occurred while creating "
                               "the %(resource)s:%(item)s"),
@@ -350,7 +372,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
     def create_network_db(self, context, network):
         # single request processing
         n = network['network']
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             args = {'tenant_id': n['tenant_id'],
                     'id': n.get('id') or uuidutils.generate_uuid(),
                     'name': n['name'],
@@ -369,7 +391,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
     @db_api.retry_if_session_inactive()
     def update_network(self, context, id, network):
         n = network['network']
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             network = self._get_network(context, id)
             # validate 'shared' parameter
             if 'shared' in n:
@@ -388,8 +410,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                         target_tenant='*', tenant_id=network['tenant_id'])
                     context.session.add(entry)
                 elif not update_shared and entry:
-                    context.session.delete(entry)
-                    context.session.expire(network, ['rbac_entries'])
+                    network.rbac_entries.remove(entry)
             # The filter call removes attributes from the body received from
             # the API that are logically tied to network resources but are
             # stored in other database tables handled by extensions
@@ -409,11 +430,17 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
         registry.notify(resources.NETWORK, events.BEFORE_DELETE, self,
                         context=context, network_id=id)
         self._ensure_network_not_in_use(context, id)
-        auto_delete_port_ids = [p.id for p in context.session.query(
-            models_v2.Port.id).filter_by(network_id=id).filter(
-            models_v2.Port.device_owner.in_(AUTO_DELETE_PORT_OWNERS))]
+        with db_api.context_manager.reader.using(context):
+            auto_delete_port_ids = [p.id for p in context.session.query(
+                models_v2.Port.id).filter_by(network_id=id).filter(
+                models_v2.Port.device_owner.in_(AUTO_DELETE_PORT_OWNERS))]
         for port_id in auto_delete_port_ids:
-            self.delete_port(context.elevated(), port_id)
+            try:
+                self.delete_port(context.elevated(), port_id)
+            except exc.PortNotFound:
+                # Don't raise if something else concurrently deleted the port
+                LOG.debug("Ignoring PortNotFound when deleting port '%s'. "
+                          "The port has already been deleted.", port_id)
         # clean up subnets
         subnets = self._get_subnets_by_network(context, id)
         with db_api.exc_to_retry(os_db_exc.DBReferenceError):
@@ -421,7 +448,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
             # cleanup if a network-owned port snuck in without failing
             for subnet in subnets:
                 self.delete_subnet(context, subnet['id'])
-            with context.session.begin(subtransactions=True):
+            with db_api.context_manager.writer.using(context):
                 network_db = self._get_network(context, id)
                 network = self._make_network_dict(network_db, context=context)
                 registry.notify(resources.NETWORK, events.PRECOMMIT_DELETE,
@@ -439,21 +466,22 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
     def get_networks(self, context, filters=None, fields=None,
                      sorts=None, limit=None, marker=None,
                      page_reverse=False):
-        marker_obj = self._get_marker_obj(context, 'network', limit, marker)
+        marker_obj = ndb_utils.get_marker_obj(self, context, 'network',
+                                              limit, marker)
         make_network_dict = functools.partial(self._make_network_dict,
                                               context=context)
-        return self._get_collection(context, models_v2.Network,
-                                    make_network_dict,
-                                    filters=filters, fields=fields,
-                                    sorts=sorts,
-                                    limit=limit,
-                                    marker_obj=marker_obj,
-                                    page_reverse=page_reverse)
+        return model_query.get_collection(context, models_v2.Network,
+                                          make_network_dict,
+                                          filters=filters, fields=fields,
+                                          sorts=sorts,
+                                          limit=limit,
+                                          marker_obj=marker_obj,
+                                          page_reverse=page_reverse)
 
     @db_api.retry_if_session_inactive()
     def get_networks_count(self, context, filters=None):
-        return self._get_collection_count(context, models_v2.Network,
-                                          filters=filters)
+        return model_query.get_collection_count(context, models_v2.Network,
+                                                filters=filters)
 
     @db_api.retry_if_session_inactive()
     def create_subnet_bulk(self, context, subnets):
@@ -523,12 +551,13 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
             # a subnet-update and a router-interface-add operation are
             # executed concurrently
             if cur_subnet and not ipv6_utils.is_ipv6_pd_enabled(s):
-                ipal = models_v2.IPAllocation
-                alloc_qry = context.session.query(ipal)
-                alloc_qry = alloc_qry.join("port", "routerport")
-                allocated = alloc_qry.filter(
-                    ipal.ip_address == cur_subnet['gateway_ip'],
-                    ipal.subnet_id == cur_subnet['id']).first()
+                with db_api.context_manager.reader.using(context):
+                    ipal = models_v2.IPAllocation
+                    alloc_qry = context.session.query(ipal)
+                    alloc_qry = alloc_qry.join("port", "routerport")
+                    allocated = alloc_qry.filter(
+                        ipal.ip_address == cur_subnet['gateway_ip'],
+                        ipal.subnet_id == cur_subnet['id']).first()
                 if allocated and allocated['port_id']:
                     raise n_exc.GatewayIpInUse(
                         ip_address=cur_subnet['gateway_ip'],
@@ -740,7 +769,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                 raise exc.BadRequest(resource='subnets', msg=msg)
             self._validate_subnet(context, s)
 
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             network = self._get_network(context,
                                         subnet['subnet']['network_id'])
             subnet, ipam_subnet = self.ipam.allocate_subnet(context,
@@ -766,8 +795,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
         The change however will not be realized until the client renew the
         dns lease or we support gratuitous DHCP offers
         """
-        orig = self.get_subnet(context, id)
-        result = self._update_subnet_precommit(context, id, subnet)
+        result, orig = self._update_subnet_precommit(context, id, subnet)
         return self._update_subnet_postcommit(context, orig, result)
 
     def _update_subnet_precommit(self, context, id, subnet):
@@ -780,6 +808,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
         s = subnet['subnet']
         new_cidr = s.get('cidr')
         db_subnet = self._get_subnet(context, id)
+        orig = self._make_subnet_dict(db_subnet, fields=None, context=context)
         # Fill 'ip_version' and 'allocation_pools' fields with the current
         # value since _validate_subnet() expects subnet spec has 'ip_version'
         # and 'allocation_pools' fields.
@@ -816,22 +845,22 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
             if gateway_ip:
                 self.ipam.validate_gw_out_of_pools(gateway_ip, pools)
 
-        if gateway_ip_changed:
-            # Provide pre-update notification not to break plugins that don't
-            # support gateway ip change
-            kwargs = {'context': context, 'subnet_id': id,
-                      'network_id': db_subnet.network_id}
-            registry.notify(resources.SUBNET_GATEWAY, events.BEFORE_UPDATE,
-                            self, **kwargs)
+        kwargs = {'context': context, 'original_subnet': orig,
+                  'request': s}
+        registry.notify(resources.SUBNET, events.BEFORE_UPDATE,
+                        self, **kwargs)
 
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             subnet, changes = self.ipam.update_db_subnet(context, id, s,
                                                          db_pools)
         # we expire here since ipam may have made changes to relationships
-        # that will be stale on any subsequent lookups while the subnet object
-        # is in the session otherwise.
-        context.session.expire(subnet)
-        return self._make_subnet_dict(subnet, context=context)
+        # that will be stale on any subsequent lookups while the subnet
+        # object is in the session otherwise.
+        # Check if subnet attached to session before expire.
+        if subnet in context.session:
+            context.session.expire(subnet)
+
+        return self._make_subnet_dict(subnet, context=context), orig
 
     @property
     def l3_rpc_notifier(self):
@@ -877,14 +906,13 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
             if routers:
                 self.l3_rpc_notifier.routers_updated(context, routers)
 
-        if orig['gateway_ip'] != result['gateway_ip']:
-            kwargs = {'context': context, 'subnet_id': result['id'],
-                      'network_id': result['network_id']}
-            registry.notify(resources.SUBNET_GATEWAY, events.AFTER_UPDATE,
-                            self, **kwargs)
-
+        kwargs = {'context': context, 'subnet': result,
+                  'original_subnet': orig}
+        registry.notify(resources.SUBNET, events.AFTER_UPDATE, self,
+                        **kwargs)
         return result
 
+    @db_api.context_manager.reader
     def _subnet_get_user_allocation(self, context, subnet_id):
         """Check if there are any user ports on subnet and return first."""
         # need to join with ports table as IPAllocation's port
@@ -895,6 +923,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                 filter(~models_v2.Port.device_owner.
                        in_(AUTO_DELETE_PORT_OWNERS)).first())
 
+    @db_api.context_manager.reader
     def _subnet_check_ip_allocations_internal_router_ports(self, context,
                                                            subnet_id):
         # Do not delete the subnet if IP allocations for internal
@@ -963,7 +992,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
         self._remove_subnet_ip_allocations_from_ports(context, id)
         # retry integrity errors to catch ip allocation races
         with db_api.exc_to_retry(sql_exc.IntegrityError), \
-                context.session.begin(subtransactions=True):
+                db_api.context_manager.writer.using(context):
             subnet_db = self._get_subnet(context, id)
             subnet = self._make_subnet_dict(subnet_db, context=context)
             registry.notify(resources.SUBNET, events.PRECOMMIT_DELETE,
@@ -989,8 +1018,8 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
 
     @db_api.retry_if_session_inactive()
     def get_subnets_count(self, context, filters=None):
-        return self._get_collection_count(context, models_v2.Subnet,
-                                          filters=filters)
+        return model_query.get_collection_count(context, models_v2.Subnet,
+                                                filters=filters)
 
     @db_api.retry_if_session_inactive()
     def get_subnets_by_network(self, context, network_id):
@@ -1099,7 +1128,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
     def update_subnetpool(self, context, id, subnetpool):
         new_sp = subnetpool['subnetpool']
 
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             orig_sp = self._get_subnetpool(context, id=id)
             updated = _update_subnetpool_dict(orig_sp, new_sp)
             reader = subnet_alloc.SubnetPoolReader(updated)
@@ -1129,8 +1158,8 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
 
         for key in ['min_prefixlen', 'max_prefixlen', 'default_prefixlen']:
             updated['key'] = str(updated[key])
-        self._apply_dict_extend_functions(attributes.SUBNETPOOLS,
-                                          updated, orig_sp.db_obj)
+        resource_extend.apply_funcs(attributes.SUBNETPOOLS,
+                                    updated, orig_sp.db_obj)
         return updated
 
     @db_api.retry_if_session_inactive()
@@ -1162,7 +1191,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
 
     @db_api.retry_if_session_inactive()
     def delete_subnetpool(self, context, id):
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             subnetpool = self._get_subnetpool(context, id=id)
             subnets = self._get_subnets_by_subnetpool(context, id)
             if subnets:
@@ -1219,7 +1248,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                          description=p.get('description'))
         if p.get('mac_address') is not constants.ATTR_NOT_SPECIFIED:
             port_data['mac_address'] = p.get('mac_address')
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             # Ensure that the network exists.
             self._get_network(context, network_id)
 
@@ -1260,7 +1289,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
     def update_port(self, context, id, port):
         new_port = port['port']
 
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             db_port = self._get_port(context, id)
             new_mac = new_port.get('mac_address')
             self._validate_port_for_update(context, db_port, new_port, new_mac)
@@ -1289,21 +1318,21 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                 # conflict, bubble up a retry instead that should bring things
                 # back to sanity.
                 raise os_db_exc.RetryRequest(e)
-        result = self._make_port_dict(db_port)
-        return result
+        return self._make_port_dict(db_port)
 
     @db_api.retry_if_session_inactive()
     def delete_port(self, context, id):
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             self.ipam.delete_port(context, id)
 
     def delete_ports_by_device_id(self, context, device_id, network_id=None):
-        query = (context.session.query(models_v2.Port.id)
-                 .enable_eagerloads(False)
-                 .filter(models_v2.Port.device_id == device_id))
-        if network_id:
-            query = query.filter(models_v2.Port.network_id == network_id)
-        port_ids = [p[0] for p in query]
+        with db_api.context_manager.reader.using(context):
+            query = (context.session.query(models_v2.Port.id)
+                     .enable_eagerloads(False)
+                     .filter(models_v2.Port.device_id == device_id))
+            if network_id:
+                query = query.filter(models_v2.Port.network_id == network_id)
+            port_ids = [p[0] for p in query]
         for port_id in port_ids:
             try:
                 self.delete_port(context, port_id)
@@ -1314,6 +1343,7 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                           port_id)
 
     @db_api.retry_if_session_inactive()
+    @db_api.context_manager.reader
     def get_port(self, context, id, fields=None):
         port = self._get_port(context, id)
         return self._make_port_dict(port, fields)
@@ -1324,8 +1354,9 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
 
         filters = filters or {}
         fixed_ips = filters.pop('fixed_ips', {})
-        query = self._get_collection_query(context, Port, filters=filters,
-                                           *args, **kwargs)
+        query = model_query.get_collection_query(context, Port,
+                                                 filters=filters,
+                                                 *args, **kwargs)
         ip_addresses = fixed_ips.get('ip_address')
         subnet_ids = fixed_ips.get('subnet_id')
         if ip_addresses:
@@ -1340,7 +1371,8 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
     def get_ports(self, context, filters=None, fields=None,
                   sorts=None, limit=None, marker=None,
                   page_reverse=False):
-        marker_obj = self._get_marker_obj(context, 'port', limit, marker)
+        marker_obj = ndb_utils.get_marker_obj(self, context, 'port',
+                                              limit, marker)
         query = self._get_ports_query(context, filters=filters,
                                       sorts=sorts, limit=limit,
                                       marker_obj=marker_obj,
@@ -1388,10 +1420,3 @@ class NeutronDbPluginV2(db_base_plugin_common.DbBasePluginCommon,
                             device_id=device_id)
                 if tenant_id != router['tenant_id']:
                     raise n_exc.DeviceIDNotOwnedByTenant(device_id=device_id)
-
-    model_query.register_hook(
-        models_v2.Port,
-        "port",
-        None,
-        '_port_filter_hook',
-        None)

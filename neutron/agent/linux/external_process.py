@@ -21,6 +21,7 @@ from oslo_concurrency import lockutils
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import fileutils
+import psutil
 import six
 
 from neutron._i18n import _, _LW, _LE
@@ -71,7 +72,7 @@ class ProcessManager(MonitoredProcess):
         self.cmd_addl_env = cmd_addl_env
         self.pids_path = pids_path or self.conf.external_pids
         self.pid_file = pid_file
-        self.run_as_root = run_as_root
+        self.run_as_root = run_as_root or self.namespace is not None
         self.custom_reload_callback = custom_reload_callback
 
         if service:
@@ -109,10 +110,11 @@ class ProcessManager(MonitoredProcess):
             if get_stop_command:
                 cmd = get_stop_command(self.get_pid_file_name())
                 ip_wrapper = ip_lib.IPWrapper(namespace=self.namespace)
-                ip_wrapper.netns.execute(cmd, addl_env=self.cmd_addl_env)
+                ip_wrapper.netns.execute(cmd, addl_env=self.cmd_addl_env,
+                                         run_as_root=self.run_as_root)
             else:
                 cmd = ['kill', '-%s' % (sig), pid]
-                utils.execute(cmd, run_as_root=True)
+                utils.execute(cmd, run_as_root=self.run_as_root)
                 # In the case of shutting down, remove the pid file
                 if sig == '9':
                     fileutils.delete_if_exists(self.get_pid_file_name())
@@ -147,12 +149,9 @@ class ProcessManager(MonitoredProcess):
         pid = self.pid
         if not pid:
             return
-
-        cmdline = '/proc/%s/cmdline' % pid
         try:
-            with open(cmdline, "r") as f:
-                return f.readline()
-        except IOError:
+            return ' '.join(psutil.Process(pid).cmdline())
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             return
 
 

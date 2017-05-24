@@ -13,21 +13,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import portbindings
+from neutron_lib.callbacks import events
+from neutron_lib.callbacks import registry
+from neutron_lib.callbacks import resources
 from neutron_lib import constants as n_const
 from neutron_lib.plugins import directory
 from oslo_log import log as logging
 from sqlalchemy import or_
 
-from neutron.callbacks import events
-from neutron.callbacks import registry
-from neutron.callbacks import resources
 from neutron.common import utils as n_utils
 
 from neutron.db import agentschedulers_db
 from neutron.db import l3_agentschedulers_db as l3agent_sch_db
 from neutron.db.models import l3agent as rb_model
 from neutron.db import models_v2
-from neutron.extensions import portbindings
 from neutron.plugins.ml2 import db as ml2_db
 from neutron.plugins.ml2 import models as ml2_models
 
@@ -428,8 +428,9 @@ def _notify_l3_agent_port_update(resource, event, trigger, **kwargs):
                 }
                 _notify_port_delete(
                     event, resource, trigger, **removed_router_args)
-            fip = l3plugin._get_floatingip_on_port(context,
-                                                   port_id=original_port['id'])
+            fips = l3plugin._get_floatingips_by_port_id(
+                context, port_id=original_port['id'])
+            fip = fips[0] if fips else None
             if fip and not (removed_routers and
                             fip['router_id'] in removed_routers):
                 l3plugin.l3_rpc_notifier.routers_updated_on_host(

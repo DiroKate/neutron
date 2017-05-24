@@ -15,6 +15,7 @@
 import contextlib
 import os
 
+from neutron_lib import constants as lib_constants
 from oslo_concurrency import lockutils
 from oslo_log import log as logging
 from oslo_utils import excutils
@@ -23,6 +24,7 @@ from neutron._i18n import _, _LE, _LW
 from neutron.agent.l3 import fip_rule_priority_allocator as frpa
 from neutron.agent.l3 import link_local_allocator as lla
 from neutron.agent.l3 import namespaces
+from neutron.agent.l3 import router_info
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import iptables_manager
 from neutron.common import constants
@@ -41,6 +43,8 @@ FIP_RT_TBL = 16
 # Rule priority range for FIPs
 FIP_PR_START = 32768
 FIP_PR_END = FIP_PR_START + 40000
+# Fixed rule priority for Fast Path Exit rules
+FAST_PATH_EXIT_PR = 80000
 
 
 class FipNamespace(namespaces.Namespace):
@@ -67,6 +71,7 @@ class FipNamespace(namespaces.Namespace):
         self.local_subnets = lla.LinkLocalAllocator(
             path, constants.DVR_FIP_LL_CIDR)
         self.destroyed = False
+        self._stale_fips_checked = False
 
     @classmethod
     def _get_ns_name(cls, ext_net_id):
@@ -123,6 +128,13 @@ class FipNamespace(namespaces.Namespace):
         with self._fip_port_lock(interface_name):
             is_first = self.subscribe(agent_gateway_port['network_id'])
             if is_first:
+                # Check for subnets that are populated for the agent
+                # gateway port that was created on the server.
+                if 'subnets' not in agent_gateway_port:
+                    self.unsubscribe(agent_gateway_port['network_id'])
+                    LOG.debug('DVR: Missing subnet in agent_gateway_port: %s',
+                              agent_gateway_port)
+                    return
                 self._create_gateway_port(agent_gateway_port, interface_name)
             else:
                 try:
@@ -205,7 +217,7 @@ class FipNamespace(namespaces.Namespace):
     @namespaces.check_ns_existence
     def _delete(self):
         ip_wrapper = ip_lib.IPWrapper(namespace=self.name)
-        for d in ip_wrapper.get_devices(exclude_loopback=True):
+        for d in ip_wrapper.get_devices():
             if d.name.startswith(FIP_2_ROUTER_DEV_PREFIX):
                 # internal link between IRs and FIP NS
                 ip_wrapper.del_veth(d.name)
@@ -283,10 +295,8 @@ class FipNamespace(namespaces.Namespace):
             # We reraise the exception in order to resync the router.
             with excutils.save_and_reraise_exception():
                 self.unsubscribe(self.agent_gateway_port['network_id'])
-                # Reset the fip count so that the create_rtr_2_fip_link
-                # is called again in this context
-                ri.dist_fip_count = 0
-                LOG.exception(_LE('DVR: Gateway update route in FIP namespace '
+                self.agent_gateway_port = None
+                LOG.exception(_LE('DVR: Gateway setup in FIP namespace '
                                   'failed'))
 
         # Now add the filter match rule for the table.
@@ -329,8 +339,7 @@ class FipNamespace(namespaces.Namespace):
         for fixed_ip in agent_gateway_port['fixed_ips']:
             ip_lib.send_ip_addr_adv_notif(ns_name,
                                           interface_name,
-                                          fixed_ip['ip_address'],
-                                          self.agent_conf.send_arp_for_ha)
+                                          fixed_ip['ip_address'])
 
         for subnet in agent_gateway_port['subnets']:
             gw_ip = subnet.get('gateway_ip')
@@ -348,6 +357,55 @@ class FipNamespace(namespaces.Namespace):
     def _add_cidr_to_device(self, device, ip_cidr):
         if not device.addr.list(to=ip_cidr):
             device.addr.add(ip_cidr, add_broadcast=False)
+
+    def delete_rtr_2_fip_link(self, ri):
+        """Delete the interface between router and FloatingIP namespace."""
+        LOG.debug("Delete FIP link interfaces for router: %s", ri.router_id)
+        rtr_2_fip_name = self.get_rtr_ext_device_name(ri.router_id)
+        fip_2_rtr_name = self.get_int_device_name(ri.router_id)
+        fip_ns_name = self.get_name()
+
+        # remove default route entry
+        if ri.rtr_fip_subnet is None:
+            # see if there is a local subnet in the cache
+            ri.rtr_fip_subnet = self.local_subnets.lookup(ri.router_id)
+
+        if ri.rtr_fip_subnet:
+            rtr_2_fip, fip_2_rtr = ri.rtr_fip_subnet.get_pair()
+            device = ip_lib.IPDevice(rtr_2_fip_name, namespace=ri.ns_name)
+            if device.exists():
+                device.route.delete_gateway(str(fip_2_rtr.ip),
+                                            table=FIP_RT_TBL)
+            if self.agent_gateway_port:
+                interface_name = self.get_ext_device_name(
+                    self.agent_gateway_port['id'])
+                fg_device = ip_lib.IPDevice(
+                    interface_name, namespace=fip_ns_name)
+                if fg_device.exists():
+                    # Remove the fip namespace rules and routes associated to
+                    # fpr interface route table.
+                    tbl_index = ri._get_snat_idx(fip_2_rtr)
+                    fip_rt_rule = ip_lib.IPRule(namespace=fip_ns_name)
+                    # Flush the table
+                    fg_device.route.flush(lib_constants.IP_VERSION_4,
+                                          table=tbl_index)
+                    fg_device.route.flush(lib_constants.IP_VERSION_6,
+                                          table=tbl_index)
+                    # Remove the rule lookup
+                    # IP is ignored in delete, but we still require it
+                    # for getting the ip_version.
+                    fip_rt_rule.rule.delete(ip=fip_2_rtr.ip,
+                                            iif=fip_2_rtr_name,
+                                            table=tbl_index,
+                                            priority=tbl_index)
+            self.local_subnets.release(ri.router_id)
+            ri.rtr_fip_subnet = None
+
+        # Check for namespace before deleting the device
+        if not self.destroyed:
+            fns_ip = ip_lib.IPWrapper(namespace=fip_ns_name)
+            if fns_ip.device(fip_2_rtr_name).exists():
+                fns_ip.del_veth(fip_2_rtr_name)
 
     def create_rtr_2_fip_link(self, ri):
         """Create interface between router and Floating IP namespace."""
@@ -384,13 +442,25 @@ class FipNamespace(namespaces.Namespace):
         rtr_2_fip_dev.route.add_gateway(str(fip_2_rtr.ip), table=FIP_RT_TBL)
 
     def scan_fip_ports(self, ri):
-        # don't scan if not dvr or count is not None
-        if ri.dist_fip_count is not None:
-            return
-
         # scan system for any existing fip ports
-        ri.dist_fip_count = 0
         rtr_2_fip_interface = self.get_rtr_ext_device_name(ri.router_id)
         device = ip_lib.IPDevice(rtr_2_fip_interface, namespace=ri.ns_name)
         if device.exists():
-            ri.dist_fip_count = len(ri.get_router_cidrs(device))
+            if len(ri.get_router_cidrs(device)):
+                self.rtr_fip_connect = True
+            else:
+                self.rtr_fip_connect = False
+            # On upgrade, there could be stale IP addresses configured, check
+            # and remove them once.
+            # TODO(haleyb): this can go away after a cycle or two
+            if not self._stale_fips_checked:
+                stale_cidrs = (
+                    ip for ip in router_info.RouterInfo.get_router_cidrs(
+                        ri, device)
+                    if common_utils.is_cidr_host(ip))
+                for ip_cidr in stale_cidrs:
+                    LOG.debug("Removing stale floating ip %s from interface "
+                              "%s in namespace %s",
+                              ip_cidr, rtr_2_fip_interface, ri.ns_name)
+                    device.delete_addr_and_conntrack_state(ip_cidr)
+                self._stale_fips_checked = True

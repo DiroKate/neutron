@@ -13,15 +13,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.callbacks import events as callbacks_events
+from neutron_lib.callbacks import registry as callbacks_registry
+from neutron_lib.callbacks import resources as callbacks_resources
+
 from neutron.common import exceptions as n_exc
 from neutron.db import api as db_api
 from neutron.db import db_base_plugin_common
 from neutron.extensions import qos
 from neutron.objects import base as base_obj
+from neutron.objects import network as network_object
+from neutron.objects import ports as ports_object
 from neutron.objects.qos import policy as policy_object
+from neutron.objects.qos import qos_policy_validator as checker
 from neutron.objects.qos import rule_type as rule_type_object
 from neutron.services.qos.drivers import manager
-from neutron.services.qos.notification_drivers import manager as driver_mgr
 from neutron.services.qos import qos_consts
 
 
@@ -32,20 +38,109 @@ class QoSPlugin(qos.QoSPluginBase):
     service parameters over ports and networks.
 
     """
-    supported_extension_aliases = ['qos']
+    supported_extension_aliases = ['qos', 'qos-bw-limit-direction']
 
     __native_pagination_support = True
     __native_sorting_support = True
 
     def __init__(self):
         super(QoSPlugin, self).__init__()
+        self.driver_manager = manager.QosServiceDriverManager()
 
-        # TODO(mangelajo): remove notification_driver_manager in Pike
-        self.notification_driver_manager = (
-            driver_mgr.QosServiceNotificationDriverManager())
+        callbacks_registry.subscribe(
+            self._validate_create_port_callback,
+            callbacks_resources.PORT,
+            callbacks_events.PRECOMMIT_CREATE)
+        callbacks_registry.subscribe(
+            self._validate_update_port_callback,
+            callbacks_resources.PORT,
+            callbacks_events.PRECOMMIT_UPDATE)
+        callbacks_registry.subscribe(
+            self._validate_update_network_callback,
+            callbacks_resources.NETWORK,
+            callbacks_events.PRECOMMIT_UPDATE)
 
-        self.driver_manager = manager.QosServiceDriverManager(enable_rpc=(
-                self.notification_driver_manager.has_message_queue_driver))
+    def _get_ports_with_policy(self, context, policy):
+        networks_ids = policy.get_bound_networks()
+        ports_with_net_policy = ports_object.Port.get_objects(
+            context, network_id=networks_ids)
+
+        # Filter only this ports which don't have overwritten policy
+        ports_with_net_policy = [
+            port for port in ports_with_net_policy if
+            port.qos_policy_id is None
+        ]
+
+        ports_ids = policy.get_bound_ports()
+        ports_with_policy = ports_object.Port.get_objects(
+            context, id=ports_ids)
+        return list(set(ports_with_policy + ports_with_net_policy))
+
+    def _validate_create_port_callback(self, resource, event, trigger,
+                                       **kwargs):
+        context = kwargs['context']
+        port_id = kwargs['port']['id']
+        port = ports_object.Port.get_object(context, id=port_id)
+        network = network_object.Network.get_object(context,
+                                                    id=port.network_id)
+
+        policy_id = port.qos_policy_id or network.qos_policy_id
+        if policy_id is None:
+            return
+
+        policy = policy_object.QosPolicy.get_object(context, id=policy_id)
+        self.validate_policy_for_port(policy, port)
+
+    def _validate_update_port_callback(self, resource, event, trigger,
+                                       **kwargs):
+        context = kwargs['context']
+        original_policy_id = kwargs['original_port'].get(
+            qos_consts.QOS_POLICY_ID)
+        policy_id = kwargs['port'].get(qos_consts.QOS_POLICY_ID)
+
+        if policy_id is None or policy_id == original_policy_id:
+            return
+
+        updated_port = ports_object.Port.get_object(
+            context, id=kwargs['port']['id'])
+        policy = policy_object.QosPolicy.get_object(context, id=policy_id)
+
+        self.validate_policy_for_port(policy, updated_port)
+
+    def _validate_update_network_callback(self, resource, event, trigger,
+                                          **kwargs):
+        context = kwargs['context']
+        original_network = kwargs['original_network']
+        updated_network = kwargs['network']
+
+        original_policy_id = original_network.get(qos_consts.QOS_POLICY_ID)
+        policy_id = updated_network.get(qos_consts.QOS_POLICY_ID)
+
+        if policy_id is None or policy_id == original_policy_id:
+            return
+
+        policy = policy_object.QosPolicy.get_object(context, id=policy_id)
+        ports = ports_object.Port.get_objects(
+                context, network_id=updated_network['id'])
+        # Filter only this ports which don't have overwritten policy
+        ports = [
+            port for port in ports if port.qos_policy_id is None
+        ]
+        self.validate_policy_for_ports(policy, ports)
+
+    def validate_policy(self, context, policy):
+        ports = self._get_ports_with_policy(context, policy)
+        self.validate_policy_for_ports(policy, ports)
+
+    def validate_policy_for_ports(self, policy, ports):
+        for port in ports:
+            self.validate_policy_for_port(policy, port)
+
+    def validate_policy_for_port(self, policy, port):
+        for rule in policy.rules:
+            if not self.driver_manager.validate_rule_for_port(rule, port):
+                raise n_exc.QosRuleNotSupported(rule_type=rule.rule_type,
+                                                port_id=port['id'])
 
     @db_base_plugin_common.convert_result_to_dict
     def create_policy(self, context, policy):
@@ -70,9 +165,6 @@ class QoSPlugin(qos.QoSPluginBase):
 
         self.driver_manager.call('create_policy', context, policy_obj)
 
-        #TODO(majopela): remove notification_driver_manager call in Pike
-        self.notification_driver_manager.create_policy(context, policy_obj)
-
         return policy_obj
 
     @db_base_plugin_common.convert_result_to_dict
@@ -95,9 +187,6 @@ class QoSPlugin(qos.QoSPluginBase):
 
         self.driver_manager.call('update_policy', context, policy_obj)
 
-        #TODO(majopela): remove notification_driver_manager call in Pike
-        self.notification_driver_manager.update_policy(context, policy_obj)
-
         return policy_obj
 
     def delete_policy(self, context, policy_id):
@@ -115,9 +204,6 @@ class QoSPlugin(qos.QoSPluginBase):
         policy.delete()
 
         self.driver_manager.call('delete_policy', context, policy)
-
-        #TODO(majopela): remove notification_driver_manager call in Pike
-        self.notification_driver_manager.delete_policy(context, policy)
 
     def _get_policy_obj(self, context, policy_id):
         """Fetch a QoS policy.
@@ -200,14 +286,13 @@ class QoSPlugin(qos.QoSPluginBase):
         with db_api.autonested_transaction(context.session):
             # Ensure that we have access to the policy.
             policy = self._get_policy_obj(context, policy_id)
+            checker.check_bandwidth_rule_conflict(policy, rule_data)
             rule = rule_cls(context, qos_policy_id=policy_id, **rule_data)
             rule.create()
             policy.reload_rules()
+            self.validate_policy(context, policy)
 
         self.driver_manager.call('update_policy', context, policy)
-
-        #TODO(majopela): remove notification_driver_manager call in Pike
-        self.notification_driver_manager.update_policy(context, policy)
 
         return rule
 
@@ -236,16 +321,15 @@ class QoSPlugin(qos.QoSPluginBase):
             # Ensure we have access to the policy.
             policy = self._get_policy_obj(context, policy_id)
             # Ensure the rule belongs to the policy.
+            checker.check_bandwidth_rule_conflict(policy, rule_data)
             policy.get_rule_by_id(rule_id)
             rule = rule_cls(context, id=rule_id)
             rule.update_fields(rule_data, reset_changes=True)
             rule.update()
             policy.reload_rules()
+            self.validate_policy(context, policy)
 
         self.driver_manager.call('update_policy', context, policy)
-
-        #TODO(majopela): remove notification_driver_manager call in Pike
-        self.notification_driver_manager.update_policy(context, policy)
 
         return rule
 
@@ -271,9 +355,6 @@ class QoSPlugin(qos.QoSPluginBase):
             policy.reload_rules()
 
         self.driver_manager.call('update_policy', context, policy)
-
-        #TODO(majopela): remove notification_driver_manager call in Pike
-        self.notification_driver_manager.update_policy(context, policy)
 
     @db_base_plugin_common.filter_fields
     @db_base_plugin_common.convert_result_to_dict

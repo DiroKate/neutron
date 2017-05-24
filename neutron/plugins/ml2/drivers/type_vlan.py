@@ -158,6 +158,12 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
                            {'min': p_const.MIN_VLAN_TAG,
                             'max': p_const.MAX_VLAN_TAG})
                     raise exc.InvalidInput(error_message=msg)
+            else:
+                if not self.network_vlan_ranges.get(physical_network):
+                    msg = (_("Physical network %s requires segmentation_id "
+                             "to be specified when creating a provider "
+                             "network") % physical_network)
+                    raise exc.InvalidInput(error_message=msg)
         elif segmentation_id:
             msg = _("segmentation_id requires physical_network for VLAN "
                     "provider network")
@@ -196,8 +202,12 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
                 api.MTU: self.get_mtu(alloc.physical_network)}
 
     def allocate_tenant_segment(self, context):
-        alloc = self.allocate_partially_specified_segment(context)
-        if not alloc:
+        for physnet in self.network_vlan_ranges:
+            alloc = self.allocate_partially_specified_segment(
+                context, physical_network=physnet)
+            if alloc:
+                break
+        else:
             return
         return {api.NETWORK_TYPE: p_const.TYPE_VLAN,
                 api.PHYSICAL_NETWORK: alloc.physical_network,
@@ -211,7 +221,7 @@ class VlanTypeDriver(helpers.SegmentTypeDriver):
         ranges = self.network_vlan_ranges.get(physical_network, [])
         inside = any(lo <= vlan_id <= hi for lo, hi in ranges)
 
-        with context.session.begin(subtransactions=True):
+        with db_api.context_manager.writer.using(context):
             query = (context.session.query(vlan_alloc_model.VlanAllocation).
                      filter_by(physical_network=physical_network,
                                vlan_id=vlan_id))

@@ -12,14 +12,20 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+<<<<<<< HEAD
 import copy
+=======
+
+import copy
+
+from neutron_lib.api.definitions import portbindings
+>>>>>>> 80e8304bfe677a62a5e7bc503ba4386f99d240a9
 from neutron_lib import constants
 from oslo_log import log
 from oslo_serialization import jsonutils
 
 from neutron._i18n import _LW
 from neutron.db import segments_db
-from neutron.extensions import portbindings
 from neutron.plugins.ml2 import driver_api as api
 
 LOG = log.getLogger(__name__)
@@ -52,12 +58,12 @@ class MechanismDriverContext(object):
 class NetworkContext(MechanismDriverContext, api.NetworkContext):
 
     def __init__(self, plugin, plugin_context, network,
-                 original_network=None):
+                 original_network=None, segments=None):
         super(NetworkContext, self).__init__(plugin, plugin_context)
         self._network = addition_param(network, plugin_context, ['os_id', 'az_id'])
         self._original_network = original_network
         self._segments = segments_db.get_network_segments(
-            plugin_context, network['id'])
+            plugin_context, network['id']) if segments is None else segments
 
     @property
     def current(self):
@@ -109,10 +115,15 @@ class PortContext(MechanismDriverContext, api.PortContext):
         self._port = addition_param(port, plugin_context, ['os_id', 'az_id'])
         # self._port = port
         self._original_port = original_port
-        self._network_context = NetworkContext(plugin, plugin_context,
-                                               network) if network else None
-        self._binding = binding
-        self._binding_levels = binding_levels
+        if isinstance(network, NetworkContext):
+            self._network_context = network
+        else:
+            self._network_context = NetworkContext(
+                plugin, plugin_context, network) if network else None
+        # NOTE(kevinbenton): these copys can go away once we are working with
+        # OVO objects here instead of native SQLA objects.
+        self._binding = copy.deepcopy(binding)
+        self._binding_levels = copy.deepcopy(binding_levels)
         self._segments_to_bind = None
         self._new_bound_segment = None
         self._next_segments_to_bind = None

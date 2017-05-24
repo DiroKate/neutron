@@ -18,8 +18,6 @@ from neutron_lib import constants as lib_constants
 from neutron_lib.utils import helpers
 from oslo_log import log as logging
 
-import six
-
 from neutron._i18n import _, _LE, _LW
 from neutron.agent.l3 import namespaces
 from neutron.agent.linux import ip_lib
@@ -438,8 +436,7 @@ class RouterInfo(object):
         for fixed_ip in fixed_ips:
             ip_lib.send_ip_addr_adv_notif(ns_name,
                                           interface_name,
-                                          fixed_ip['ip_address'],
-                                          self.agent_conf.send_arp_for_ha)
+                                          fixed_ip['ip_address'])
 
     def internal_network_added(self, port):
         network_id = port['network_id']
@@ -468,7 +465,7 @@ class RouterInfo(object):
 
     def _get_existing_devices(self):
         ip_wrapper = ip_lib.IPWrapper(namespace=self.ns_name)
-        ip_devs = ip_wrapper.get_devices(exclude_loopback=True)
+        ip_devs = ip_wrapper.get_devices()
         return [ip_dev.name for ip_dev in ip_devs]
 
     @staticmethod
@@ -647,14 +644,25 @@ class RouterInfo(object):
                 device = ip_lib.IPDevice(device_name, namespace=namespace)
                 device.route.add_route(subnet['gateway_ip'], scope='link')
 
-    def _enable_ra_on_gw(self, ex_gw_port, ns_name, interface_name):
-        gateway_ips = self._get_external_gw_ips(ex_gw_port)
-        if not self.use_ipv6 or self.is_v6_gateway_set(gateway_ips):
+    def _configure_ipv6_params_on_gw(self, ex_gw_port, ns_name, interface_name,
+                                     enabled):
+        if not self.use_ipv6:
             return
 
-        # There is no IPv6 gw_ip, use RouterAdvt for default route.
-        self.driver.configure_ipv6_ra(ns_name, interface_name,
-                                      n_const.ACCEPT_RA_WITH_FORWARDING)
+        disable_ra = not enabled
+        if enabled:
+            gateway_ips = self._get_external_gw_ips(ex_gw_port)
+            if not self.is_v6_gateway_set(gateway_ips):
+                # There is no IPv6 gw_ip, use RouterAdvt for default route.
+                self.driver.configure_ipv6_ra(
+                    ns_name, interface_name, n_const.ACCEPT_RA_WITH_FORWARDING)
+            else:
+                # Otherwise, disable it
+                disable_ra = True
+        if disable_ra:
+            self.driver.configure_ipv6_ra(ns_name, interface_name,
+                                          n_const.ACCEPT_RA_DISABLED)
+        self.driver.configure_ipv6_forwarding(ns_name, interface_name, enabled)
 
     def _external_gateway_added(self, ex_gw_port, interface_name,
                                 ns_name, preserve_ips):
@@ -690,13 +698,13 @@ class RouterInfo(object):
         for ip in gateway_ips:
             device.route.add_gateway(ip)
 
-        self._enable_ra_on_gw(ex_gw_port, ns_name, interface_name)
+        self._configure_ipv6_params_on_gw(ex_gw_port, ns_name, interface_name,
+                                          True)
 
         for fixed_ip in ex_gw_port['fixed_ips']:
             ip_lib.send_ip_addr_adv_notif(ns_name,
                                           interface_name,
-                                          fixed_ip['ip_address'],
-                                          self.agent_conf.send_arp_for_ha)
+                                          fixed_ip['ip_address'])
 
     def is_v6_gateway_set(self, gateway_ips):
         """Check to see if list of gateway_ips has an IPv6 gateway.
@@ -1018,7 +1026,7 @@ class RouterInfo(object):
                 iptables['filter'].add_rule(
                     'scope',
                     self.address_scope_filter_rule(device_name, mark))
-        for subnet_id, prefix in six.iteritems(self.pd_subnets):
+        for subnet_id, prefix in self.pd_subnets.items():
             if prefix != n_const.PROVISIONAL_IPV6_PD_PREFIX:
                 self._process_pd_iptables_rules(prefix, subnet_id)
 

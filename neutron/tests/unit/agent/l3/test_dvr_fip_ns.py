@@ -20,6 +20,7 @@ from oslo_utils import uuidutils
 from neutron.agent.common import utils
 from neutron.agent.l3 import dvr_fip_ns
 from neutron.agent.l3 import link_local_allocator as lla
+from neutron.agent.l3 import router_info
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import iptables_manager
 from neutron.common import exceptions as n_exc
@@ -114,16 +115,15 @@ class TestDvrFipNs(base.BaseTestCase):
         self.fip_ns._check_for_gateway_ip_change = mock.Mock(return_value=True)
         agent_gw_port = self._get_agent_gw_port()
         interface_name = self.fip_ns.get_ext_device_name(agent_gw_port['id'])
+        self.fip_ns.agent_gateway_port = agent_gw_port
         self.fip_ns.create_or_update_gateway_port(agent_gw_port)
         expected = [
             mock.call(self.fip_ns.get_name(),
                       interface_name,
-                      agent_gw_port['fixed_ips'][0]['ip_address'],
-                      mock.ANY),
+                      agent_gw_port['fixed_ips'][0]['ip_address']),
             mock.call(self.fip_ns.get_name(),
                       interface_name,
-                      agent_gw_port['fixed_ips'][1]['ip_address'],
-                      mock.ANY)]
+                      agent_gw_port['fixed_ips'][1]['ip_address'])]
         send_adv_notif.assert_has_calls(expected)
         self.assertTrue(def_gw.called)
 
@@ -133,14 +133,13 @@ class TestDvrFipNs(base.BaseTestCase):
     @mock.patch.object(dvr_fip_ns.FipNamespace, 'unsubscribe')
     def test_update_gateway_port_raises_exception(
         self, fip_unsub, fip_delete, fip_sub, exists):
-        self.fip_ns._check_for_gateway_ip_change = mock.Mock(return_value=True)
-        self.fip_ns.agent_gateway_port = None
         agent_gw_port = self._get_agent_gw_port()
         self.fip_ns._create_gateway_port = mock.Mock()
         self.fip_ns.create_or_update_gateway_port(agent_gw_port)
         exists.return_value = False
         fip_sub.return_value = False
         self.fip_ns._check_for_gateway_ip_change = mock.Mock(return_value=True)
+        self.fip_ns.agent_gateway_port = agent_gw_port
 
         self.assertRaises(n_exc.FloatingIpSetupException,
                           self.fip_ns.create_or_update_gateway_port,
@@ -158,7 +157,8 @@ class TestDvrFipNs(base.BaseTestCase):
         self.fip_ns.agent_gateway_port = None
         agent_gw_port = self._get_agent_gw_port()
         agent_gw_port['subnets'][0]['gateway_ip'] = '20.0.1.1'
-
+        self.fip_ns._check_for_gateway_ip_change = mock.Mock(return_value=True)
+        self.fip_ns.agent_gateway_port = agent_gw_port
         self.fip_ns.create_or_update_gateway_port(agent_gw_port)
 
         IPDevice().route.add_route.assert_called_once_with('20.0.1.1',
@@ -311,32 +311,32 @@ class TestDvrFipNs(base.BaseTestCase):
     def test_create_rtr_2_fip_link_and_addr_already_exist(self):
         self._test_create_rtr_2_fip_link(True, True)
 
+    @mock.patch.object(router_info.RouterInfo, 'get_router_cidrs')
     @mock.patch.object(ip_lib, 'IPDevice')
-    def _test_scan_fip_ports(self, ri, ip_list, IPDevice):
+    def _test_scan_fip_ports(self, ri, ip_list, stale_list, IPDevice,
+        get_router_cidrs):
         IPDevice.return_value = device = mock.Mock()
         device.exists.return_value = True
         ri.get_router_cidrs.return_value = ip_list
+        get_router_cidrs.return_value = stale_list
         self.fip_ns.get_rtr_ext_device_name = mock.Mock(
             return_value=mock.sentinel.rtr_ext_device_name)
         self.fip_ns.scan_fip_ports(ri)
+        if stale_list:
+            device.delete_addr_and_conntrack_state.assert_called_once_with(
+                stale_list[0])
 
     def test_scan_fip_ports_restart_fips(self):
         ri = mock.Mock()
-        ri.dist_fip_count = None
         ri.floating_ips_dict = {}
         ip_list = [{'cidr': '111.2.3.4'}, {'cidr': '111.2.3.5'}]
-        self._test_scan_fip_ports(ri, ip_list)
-        self.assertEqual(2, ri.dist_fip_count)
+        stale_list = ['111.2.3.7/32']
+        self._test_scan_fip_ports(ri, ip_list, stale_list)
+        self.assertTrue(ri.rtr_fip_connect)
 
     def test_scan_fip_ports_restart_none(self):
         ri = mock.Mock()
-        ri.dist_fip_count = None
         ri.floating_ips_dict = {}
-        self._test_scan_fip_ports(ri, [])
-        self.assertEqual(0, ri.dist_fip_count)
-
-    def test_scan_fip_ports_restart_zero(self):
-        ri = mock.Mock()
-        ri.dist_fip_count = 0
-        self._test_scan_fip_ports(ri, None)
-        self.assertEqual(0, ri.dist_fip_count)
+        ri.rtr_fip_connect = False
+        self._test_scan_fip_ports(ri, [], [])
+        self.assertFalse(ri.rtr_fip_connect)
